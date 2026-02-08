@@ -155,10 +155,8 @@ export function buildCostBasis(swapTxns, transferTxns, wallet) {
 
 export function enrichTokens(accounts, dexData) {
   return accounts.map((a) => {
-    // Match on baseToken OR quoteToken (pump.fun tokens sometimes appear as quote)
     const matches = dexData.filter((p) => p.baseToken?.address === a.mint || p.quoteToken?.address === a.mint);
     const best = matches.sort((x, y) => (y.liquidity?.usd || 0) - (x.liquidity?.usd || 0))[0];
-    // If matched as quoteToken, swap price reference
     const isBase = best?.baseToken?.address === a.mint;
     const sym = isBase ? best?.baseToken?.symbol : best?.quoteToken?.symbol;
     const nam = isBase ? best?.baseToken?.name : best?.quoteToken?.name;
@@ -170,6 +168,7 @@ export function enrichTokens(accounts, dexData) {
       volume24h: best?.volume?.h24 || 0, liquidity: best?.liquidity?.usd || 0,
       marketCap: best?.marketCap || best?.fdv || 0,
       imageUrl: best?.info?.imageUrl, pairUrl: best?.url,
+      pairAddress: best?.pairAddress || null,
       txns: best?.txns || {}, dexId: best?.dexId,
     };
   });
@@ -181,4 +180,49 @@ export function buildSnapshot(tokens, solBal, solPrice) {
   const sorted = [...tokens].sort((a, b) => b.balance * (b.priceUsd || 0) - a.balance * (a.priceUsd || 0));
   const topPct = tv > 0 && sorted.length ? (sorted[0].balance * (sorted[0].priceUsd || 0)) / tv * 100 : 0;
   return { totalValue: tv + sv, solBal, tokenCount: tokens.length, tokenVal: tv, topPct, avgVal: tokens.length ? tv / tokens.length : 0 };
+}
+
+// Build simulated historical portfolio data from cost-basis trades
+// Assumes 0 balance at 2/5/26, cost-basis starts 2/6/26
+export function buildHistoricalData(cb, tokens, solBal, solPrice) {
+  const START_TS = new Date("2026-02-06T04:00:00Z").getTime() / 1000; // 2/6/26 11PM EST = 4AM UTC 2/6
+  const now = Date.now() / 1000;
+  const allTrades = [];
+  for (const [mint, c] of Object.entries(cb)) {
+    const tok = tokens.find(t => t.mint === mint);
+    for (const t of c.trades) {
+      if (t.ts >= START_TS) allTrades.push({ ...t, mint, symbol: tok?.symbol || mint.slice(0, 6) });
+    }
+  }
+  allTrades.sort((a, b) => a.ts - b.ts);
+  // Build daily snapshots
+  const days = [];
+  const dayMs = 86400;
+  let runSol = 0;
+  const holdings = {};
+  for (let ts = START_TS; ts <= now; ts += dayMs) {
+    const dayEnd = ts + dayMs;
+    for (const t of allTrades) {
+      if (t.ts >= ts && t.ts < dayEnd) {
+        if (t.type === "BUY") { runSol -= t.sol; holdings[t.mint] = (holdings[t.mint] || 0) + t.amount; }
+        if (t.type === "SELL") { runSol += t.sol; holdings[t.mint] = (holdings[t.mint] || 0) - t.amount; }
+      }
+    }
+    // Current token values in SOL using priceNative
+    let tokValSol = 0;
+    for (const [mint, bal] of Object.entries(holdings)) {
+      if (bal <= 0) continue;
+      const tok = tokens.find(t => t.mint === mint);
+      tokValSol += bal * (tok?.priceNative || 0);
+    }
+    days.push({ ts, date: new Date(ts * 1000), solBal: Math.max(0, solBal + runSol), tokValSol, totalSol: Math.max(0, solBal + runSol) + tokValSol });
+  }
+  return days;
+}
+
+// Generate Solana Pay QR code URL
+export function solanPayUrl(recipient, amount) {
+  let url = `solana:${recipient}`;
+  if (amount) url += `?amount=${amount}`;
+  return url;
 }
