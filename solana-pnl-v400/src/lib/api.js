@@ -36,7 +36,7 @@ export async function dexTokens(mints) {
     try {
       const r = await fetch("https://api.dexscreener.com/tokens/v1/solana/" + batch.join(","));
       if (r.ok) { const d = await r.json(); out.push(...(Array.isArray(d) ? d : d.pairs || [])); }
-    } catch (e) { console.warn("DexScreener err:", e); }
+    } catch (e) { console.warn("DexScreener batch err:", e); }
     if (i + 30 < mints.length) await new Promise((r) => setTimeout(r, 350));
   }
   return out;
@@ -109,6 +109,7 @@ export function buildCostBasis(swapTxns, transferTxns, wallet) {
   const ensure = (mint) => {
     if (!data[mint]) data[mint] = { solSpent: 0, solReceived: 0, bought: 0, sold: 0, trades: [], transfers: [] };
   };
+
   for (const tx of swapTxns) {
     if (!tx.tokenTransfers?.length) continue;
     const ts = tx.timestamp;
@@ -123,18 +124,25 @@ export function buildCostBasis(swapTxns, transferTxns, wallet) {
         if (tt.toUserAccount === wallet) solIn += tt.tokenAmount || 0;
       }
     }
-    for (const tt of tx.tokenTransfers) {
-      if (!tt.mint || tt.mint === SOL_MINT) continue;
+    const tokenMoves = tx.tokenTransfers.filter(tt => tt.mint && tt.mint !== SOL_MINT);
+    const myMoves = tokenMoves.filter(tt => (tt.toUserAccount === wallet || tt.fromUserAccount === wallet) && (tt.tokenAmount || 0) > 0);
+    const numMoves = myMoves.length || 1;
+    for (const tt of tokenMoves) {
+      if (!tt.mint) continue;
       ensure(tt.mint);
       const amt = tt.tokenAmount || 0;
-      if (tt.toUserAccount === wallet && amt > 0) {
+      if (amt <= 0) continue;
+      const share = 1 / numMoves;
+      if (tt.toUserAccount === wallet) {
+        const cost = solOut * share;
         data[tt.mint].bought += amt;
-        data[tt.mint].solSpent += solOut;
-        data[tt.mint].trades.push({ type: "BUY", amount: amt, sol: solOut, ts, sig: tx.signature });
-      } else if (tt.fromUserAccount === wallet && amt > 0) {
+        data[tt.mint].solSpent += cost;
+        data[tt.mint].trades.push({ type: "BUY", amount: amt, sol: cost, ts, sig: tx.signature });
+      } else if (tt.fromUserAccount === wallet) {
+        const gain = solIn * share;
         data[tt.mint].sold += amt;
-        data[tt.mint].solReceived += solIn;
-        data[tt.mint].trades.push({ type: "SELL", amount: amt, sol: solIn, ts, sig: tx.signature });
+        data[tt.mint].solReceived += gain;
+        data[tt.mint].trades.push({ type: "SELL", amount: amt, sol: gain, ts, sig: tx.signature });
       }
     }
   }
@@ -156,20 +164,46 @@ export function buildCostBasis(swapTxns, transferTxns, wallet) {
 export function enrichTokens(accounts, dexData) {
   return accounts.map((a) => {
     const matches = dexData.filter((p) => p.baseToken?.address === a.mint || p.quoteToken?.address === a.mint);
-    const best = matches.sort((x, y) => (y.liquidity?.usd || 0) - (x.liquidity?.usd || 0))[0];
-    const isBase = best?.baseToken?.address === a.mint;
-    const sym = isBase ? best?.baseToken?.symbol : best?.quoteToken?.symbol;
-    const nam = isBase ? best?.baseToken?.name : best?.quoteToken?.name;
+    const baseMatches = matches.filter(p => p.baseToken?.address === a.mint);
+    const sorted = (baseMatches.length > 0 ? baseMatches : matches).sort((x, y) => (y.liquidity?.usd || 0) - (x.liquidity?.usd || 0));
+    const best = sorted[0];
+    if (!best) return { ...a, symbol: null, name: null, priceUsd: 0, priceNative: 0, priceChange24h: 0, volume24h: 0, liquidity: 0, marketCap: 0, imageUrl: null, pairUrl: null, pairAddress: null, txns: {}, dexId: null };
+    const isBase = best.baseToken?.address === a.mint;
     return {
-      ...a, symbol: sym, name: nam,
-      priceUsd: best ? parseFloat(best.priceUsd || 0) : 0,
-      priceNative: best ? parseFloat(best.priceNative || 0) : 0,
-      priceChange24h: best?.priceChange?.h24 || 0,
-      volume24h: best?.volume?.h24 || 0, liquidity: best?.liquidity?.usd || 0,
-      marketCap: best?.marketCap || best?.fdv || 0,
-      imageUrl: best?.info?.imageUrl, pairUrl: best?.url,
-      pairAddress: best?.pairAddress || null,
-      txns: best?.txns || {}, dexId: best?.dexId,
+      ...a,
+      symbol: isBase ? best.baseToken?.symbol : best.quoteToken?.symbol,
+      name: isBase ? best.baseToken?.name : best.quoteToken?.name,
+      priceUsd: isBase ? parseFloat(best.priceUsd || 0) : 0,
+      priceNative: isBase ? parseFloat(best.priceNative || 0) : 0,
+      priceChange24h: best.priceChange?.h24 || 0,
+      volume24h: best.volume?.h24 || 0,
+      liquidity: best.liquidity?.usd || 0,
+      marketCap: best.marketCap || best.fdv || 0,
+      imageUrl: best.info?.imageUrl || null,
+      pairUrl: best.url,
+      pairAddress: best.pairAddress || null,
+      txns: best.txns || {}, dexId: best.dexId,
+    };
+  });
+}
+
+// Fetch fresh prices for existing tokens (lightweight refresh)
+export async function refreshTokenPrices(tokens) {
+  const mints = tokens.map(t => t.mint).filter(Boolean);
+  if (!mints.length) return tokens;
+  const dx = await dexTokens(mints);
+  return tokens.map(t => {
+    const matches = dx.filter(p => p.baseToken?.address === t.mint);
+    const best = matches.sort((x, y) => (y.liquidity?.usd || 0) - (x.liquidity?.usd || 0))[0];
+    if (!best) return t;
+    return {
+      ...t,
+      priceUsd: parseFloat(best.priceUsd || 0),
+      priceNative: parseFloat(best.priceNative || 0),
+      priceChange24h: best.priceChange?.h24 || 0,
+      volume24h: best.volume?.h24 || 0,
+      marketCap: best.marketCap || best.fdv || 0,
+      imageUrl: best.info?.imageUrl || t.imageUrl,
     };
   });
 }
@@ -182,10 +216,8 @@ export function buildSnapshot(tokens, solBal, solPrice) {
   return { totalValue: tv + sv, solBal, tokenCount: tokens.length, tokenVal: tv, topPct, avgVal: tokens.length ? tv / tokens.length : 0 };
 }
 
-// Build simulated historical portfolio data from cost-basis trades
-// Assumes 0 balance at 2/5/26, cost-basis starts 2/6/26
 export function buildHistoricalData(cb, tokens, solBal, solPrice) {
-  const START_TS = new Date("2026-02-06T04:00:00Z").getTime() / 1000; // 2/6/26 11PM EST = 4AM UTC 2/6
+  const START_TS = new Date("2026-02-06T04:00:00Z").getTime() / 1000;
   const now = Date.now() / 1000;
   const allTrades = [];
   for (const [mint, c] of Object.entries(cb)) {
@@ -195,34 +227,69 @@ export function buildHistoricalData(cb, tokens, solBal, solPrice) {
     }
   }
   allTrades.sort((a, b) => a.ts - b.ts);
-  // Build daily snapshots
-  const days = [];
-  const dayMs = 86400;
+  const points = [];
+  const interval = 4 * 3600; // 4-hour intervals for sharpness
   let runSol = 0;
   const holdings = {};
-  for (let ts = START_TS; ts <= now; ts += dayMs) {
-    const dayEnd = ts + dayMs;
+  for (let ts = START_TS; ts <= now; ts += interval) {
+    const end = ts + interval;
     for (const t of allTrades) {
-      if (t.ts >= ts && t.ts < dayEnd) {
+      if (t.ts >= ts && t.ts < end) {
         if (t.type === "BUY") { runSol -= t.sol; holdings[t.mint] = (holdings[t.mint] || 0) + t.amount; }
         if (t.type === "SELL") { runSol += t.sol; holdings[t.mint] = (holdings[t.mint] || 0) - t.amount; }
       }
     }
-    // Current token values in SOL using priceNative
     let tokValSol = 0;
     for (const [mint, bal] of Object.entries(holdings)) {
       if (bal <= 0) continue;
       const tok = tokens.find(t => t.mint === mint);
       tokValSol += bal * (tok?.priceNative || 0);
     }
-    days.push({ ts, date: new Date(ts * 1000), solBal: Math.max(0, solBal + runSol), tokValSol, totalSol: Math.max(0, solBal + runSol) + tokValSol });
+    const sb = Math.max(0, solBal + runSol);
+    points.push({ ts, date: new Date(ts * 1000), solBal: sb, tokValSol, totalSol: sb + tokValSol });
   }
-  return days;
+  return points;
 }
 
-// Generate Solana Pay QR code URL
 export function solanPayUrl(recipient, amount) {
   let url = `solana:${recipient}`;
   if (amount) url += `?amount=${amount}`;
   return url;
+}
+
+// Total PnL for a token = realized + unrealized
+export function tokenTotalPnl(cbEntry, token) {
+  if (!cbEntry) return 0;
+  const realized = cbEntry.solReceived - cbEntry.solSpent;
+  const remaining = cbEntry.bought - cbEntry.sold;
+  if (remaining <= 0 || !token?.priceNative) return realized;
+  const avgCost = cbEntry.bought > 0 ? cbEntry.solSpent / cbEntry.bought : 0;
+  const unrealized = (remaining * (token.priceNative || 0)) - (remaining * avgCost);
+  return realized + unrealized;
+}
+
+// Find the single best SELL trade (highest SOL received in one trade)
+export function findBestTrade(cb, tokens) {
+  let best = null;
+  for (const [mint, c] of Object.entries(cb)) {
+    const tok = tokens.find(t => t.mint === mint);
+    for (const t of c.trades) {
+      if (t.type === "SELL" && t.sol > 0) {
+        if (!best || t.sol > best.sol) {
+          best = { mint, sol: t.sol, symbol: tok?.symbol || null, sig: t.sig };
+        }
+      }
+    }
+  }
+  // Also check net PnL per token (in case no sells yet but holding is profitable)
+  if (!best) {
+    for (const [mint, c] of Object.entries(cb)) {
+      const tok = tokens.find(t => t.mint === mint);
+      const pnl = tokenTotalPnl(c, tok);
+      if (!best || pnl > best.sol) {
+        best = { mint, sol: pnl, symbol: tok?.symbol || null };
+      }
+    }
+  }
+  return best;
 }
