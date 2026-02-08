@@ -6,7 +6,9 @@ export async function rpc(method, params, endpoint = HELIUS_RPC) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
-  return (await r.json()).result;
+  const j = await r.json();
+  if (j.error) console.warn("RPC error:", j.error);
+  return j.result;
 }
 
 export async function getSolBalance(wallet) {
@@ -14,43 +16,100 @@ export async function getSolBalance(wallet) {
   return (r?.value || 0) / LAMPORTS;
 }
 
+// Fetch ALL token accounts - both SPL Token AND Token-2022 programs
 export async function getTokenAccounts(wallet) {
-  const r = await rpc("getTokenAccountsByOwner", [
-    wallet,
-    { programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" },
-    { encoding: "jsonParsed" },
+  const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+  const TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+  const [r1, r2] = await Promise.all([
+    rpc("getTokenAccountsByOwner", [wallet, { programId: TOKEN_PROGRAM }, { encoding: "jsonParsed" }]),
+    rpc("getTokenAccountsByOwner", [wallet, { programId: TOKEN_2022 }, { encoding: "jsonParsed" }]).catch(() => null),
   ]);
-  return (r?.value || [])
+
+  const all = [...(r1?.value || []), ...(r2?.value || [])];
+  return all
     .map((a) => {
-      const i = a.account.data.parsed.info;
-      return { mint: i.mint, balance: parseFloat(i.tokenAmount.uiAmountString || "0"), decimals: i.tokenAmount.decimals };
+      try {
+        const i = a.account.data.parsed.info;
+        return {
+          mint: i.mint,
+          balance: parseFloat(i.tokenAmount.uiAmountString || "0"),
+          decimals: i.tokenAmount.decimals,
+        };
+      } catch (e) { return null; }
     })
-    .filter((t) => t.balance > 0);
+    .filter((t) => t && t.balance > 0);
 }
 
+// DexScreener - try multiple API endpoints for robustness
 export async function dexTokens(mints) {
   if (!mints.length) return [];
   const out = [];
+
   for (let i = 0; i < mints.length; i += 30) {
     const batch = mints.slice(i, i + 30);
+
+    // Try the v1 endpoint first
+    let gotData = false;
     try {
       const r = await fetch("https://api.dexscreener.com/tokens/v1/solana/" + batch.join(","));
-      if (r.ok) { const d = await r.json(); out.push(...(Array.isArray(d) ? d : d.pairs || [])); }
-    } catch (e) { console.warn("DexScreener batch err:", e); }
-    if (i + 30 < mints.length) await new Promise((r) => setTimeout(r, 350));
+      if (r.ok) {
+        const d = await r.json();
+        const pairs = Array.isArray(d) ? d : d.pairs || [];
+        if (pairs.length > 0) { out.push(...pairs); gotData = true; }
+      }
+    } catch (e) { console.warn("DexScreener v1 err:", e); }
+
+    // Fallback: try latest/dex/tokens for each mint individually
+    if (!gotData) {
+      for (const mint of batch) {
+        try {
+          const r = await fetch("https://api.dexscreener.com/latest/dex/tokens/" + mint);
+          if (r.ok) {
+            const d = await r.json();
+            const pairs = d.pairs || [];
+            if (pairs.length > 0) out.push(...pairs);
+          }
+        } catch (e) {}
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+
+    if (i + 30 < mints.length) await new Promise(r => setTimeout(r, 350));
   }
   return out;
 }
 
 export async function dexPairs(mint) {
+  // Try v1 first, then latest
   try {
     const r = await fetch("https://api.dexscreener.com/token-pairs/v1/solana/" + mint);
-    if (r.ok) { const d = await r.json(); return Array.isArray(d) ? d : d.pairs || []; }
+    if (r.ok) {
+      const d = await r.json();
+      const pairs = Array.isArray(d) ? d : d.pairs || [];
+      if (pairs.length > 0) return pairs;
+    }
+  } catch (e) {}
+  try {
+    const r = await fetch("https://api.dexscreener.com/latest/dex/tokens/" + mint);
+    if (r.ok) {
+      const d = await r.json();
+      if (d.pairs?.length > 0) return d.pairs;
+    }
   } catch (e) {}
   return [];
 }
 
 export async function getSolPrice() {
+  try {
+    const r = await fetch("https://api.dexscreener.com/latest/dex/tokens/" + SOL_MINT);
+    if (r.ok) {
+      const d = await r.json();
+      const p = (d.pairs || [])[0];
+      if (p) return parseFloat(p.priceUsd || 0);
+    }
+  } catch (e) {}
+  // Fallback to v1
   try {
     const r = await fetch("https://api.dexscreener.com/tokens/v1/solana/" + SOL_MINT);
     if (r.ok) {
@@ -78,7 +137,7 @@ export async function fetchSwaps(wallet, maxPages = 8) {
       lastSig = txns[txns.length - 1].signature;
       if (txns.length < 100) break;
     } catch (e) { break; }
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise(r => setTimeout(r, 150));
   }
   return all;
 }
@@ -99,7 +158,7 @@ export async function fetchTransfers(wallet, maxPages = 4) {
       lastSig = txns[txns.length - 1].signature;
       if (txns.length < 100) break;
     } catch (e) { break; }
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise(r => setTimeout(r, 150));
   }
   return all;
 }
@@ -109,7 +168,6 @@ export function buildCostBasis(swapTxns, transferTxns, wallet) {
   const ensure = (mint) => {
     if (!data[mint]) data[mint] = { solSpent: 0, solReceived: 0, bought: 0, sold: 0, trades: [], transfers: [] };
   };
-
   for (const tx of swapTxns) {
     if (!tx.tokenTransfers?.length) continue;
     const ts = tx.timestamp;
@@ -161,18 +219,25 @@ export function buildCostBasis(swapTxns, transferTxns, wallet) {
   return data;
 }
 
+// Enrich tokens with DexScreener data
 export function enrichTokens(accounts, dexData) {
   return accounts.map((a) => {
     const matches = dexData.filter((p) => p.baseToken?.address === a.mint || p.quoteToken?.address === a.mint);
     const baseMatches = matches.filter(p => p.baseToken?.address === a.mint);
     const sorted = (baseMatches.length > 0 ? baseMatches : matches).sort((x, y) => (y.liquidity?.usd || 0) - (x.liquidity?.usd || 0));
     const best = sorted[0];
-    if (!best) return { ...a, symbol: null, name: null, priceUsd: 0, priceNative: 0, priceChange24h: 0, volume24h: 0, liquidity: 0, marketCap: 0, imageUrl: null, pairUrl: null, pairAddress: null, txns: {}, dexId: null };
+    if (!best) {
+      return { ...a, symbol: null, name: null, priceUsd: 0, priceNative: 0, priceChange24h: 0, volume24h: 0, liquidity: 0, marketCap: 0, imageUrl: null, pairUrl: null, pairAddress: null, dextoolsUrl: null };
+    }
     const isBase = best.baseToken?.address === a.mint;
+    const sym = isBase ? best.baseToken?.symbol : best.quoteToken?.symbol;
+    const nam = isBase ? best.baseToken?.name : best.quoteToken?.name;
+    const pairAddr = best.pairAddress || null;
+    // Build dextools URL from pair address
+    const dextoolsUrl = pairAddr ? `https://www.dextools.io/app/solana/pair-explorer/${pairAddr}` : null;
     return {
       ...a,
-      symbol: isBase ? best.baseToken?.symbol : best.quoteToken?.symbol,
-      name: isBase ? best.baseToken?.name : best.quoteToken?.name,
+      symbol: sym, name: nam,
       priceUsd: isBase ? parseFloat(best.priceUsd || 0) : 0,
       priceNative: isBase ? parseFloat(best.priceNative || 0) : 0,
       priceChange24h: best.priceChange?.h24 || 0,
@@ -181,13 +246,13 @@ export function enrichTokens(accounts, dexData) {
       marketCap: best.marketCap || best.fdv || 0,
       imageUrl: best.info?.imageUrl || null,
       pairUrl: best.url,
-      pairAddress: best.pairAddress || null,
-      txns: best.txns || {}, dexId: best.dexId,
+      pairAddress: pairAddr,
+      dextoolsUrl,
     };
   });
 }
 
-// Fetch fresh prices for existing tokens (lightweight refresh)
+// Lightweight price refresh for existing tokens
 export async function refreshTokenPrices(tokens) {
   const mints = tokens.map(t => t.mint).filter(Boolean);
   if (!mints.length) return tokens;
@@ -196,6 +261,7 @@ export async function refreshTokenPrices(tokens) {
     const matches = dx.filter(p => p.baseToken?.address === t.mint);
     const best = matches.sort((x, y) => (y.liquidity?.usd || 0) - (x.liquidity?.usd || 0))[0];
     if (!best) return t;
+    const pairAddr = best.pairAddress || t.pairAddress;
     return {
       ...t,
       priceUsd: parseFloat(best.priceUsd || 0),
@@ -204,16 +270,24 @@ export async function refreshTokenPrices(tokens) {
       volume24h: best.volume?.h24 || 0,
       marketCap: best.marketCap || best.fdv || 0,
       imageUrl: best.info?.imageUrl || t.imageUrl,
+      pairAddress: pairAddr,
+      dextoolsUrl: pairAddr ? `https://www.dextools.io/app/solana/pair-explorer/${pairAddr}` : t.dextoolsUrl,
     };
   });
+}
+
+// Full re-fetch of token accounts + enrichment (for 5-min refresh)
+export async function refreshHoldings(wallet) {
+  const accs = await getTokenAccounts(wallet);
+  if (!accs.length) return [];
+  const dx = await dexTokens(accs.map(a => a.mint));
+  return enrichTokens(accs, dx);
 }
 
 export function buildSnapshot(tokens, solBal, solPrice) {
   const tv = tokens.reduce((s, t) => s + t.balance * (t.priceUsd || 0), 0);
   const sv = solBal * (solPrice || 0);
-  const sorted = [...tokens].sort((a, b) => b.balance * (b.priceUsd || 0) - a.balance * (a.priceUsd || 0));
-  const topPct = tv > 0 && sorted.length ? (sorted[0].balance * (sorted[0].priceUsd || 0)) / tv * 100 : 0;
-  return { totalValue: tv + sv, solBal, tokenCount: tokens.length, tokenVal: tv, topPct, avgVal: tokens.length ? tv / tokens.length : 0 };
+  return { totalValue: tv + sv, solBal, tokenCount: tokens.length, tokenVal: tv };
 }
 
 export function buildHistoricalData(cb, tokens, solBal, solPrice) {
@@ -228,7 +302,7 @@ export function buildHistoricalData(cb, tokens, solBal, solPrice) {
   }
   allTrades.sort((a, b) => a.ts - b.ts);
   const points = [];
-  const interval = 4 * 3600; // 4-hour intervals for sharpness
+  const interval = 4 * 3600;
   let runSol = 0;
   const holdings = {};
   for (let ts = START_TS; ts <= now; ts += interval) {
@@ -252,9 +326,7 @@ export function buildHistoricalData(cb, tokens, solBal, solPrice) {
 }
 
 export function solanPayUrl(recipient, amount) {
-  let url = `solana:${recipient}`;
-  if (amount) url += `?amount=${amount}`;
-  return url;
+  return amount ? `solana:${recipient}?amount=${amount}` : `solana:${recipient}`;
 }
 
 // Total PnL for a token = realized + unrealized
@@ -268,27 +340,22 @@ export function tokenTotalPnl(cbEntry, token) {
   return realized + unrealized;
 }
 
-// Find the single best SELL trade (highest SOL received in one trade)
+// Find best single sell trade
 export function findBestTrade(cb, tokens) {
   let best = null;
   for (const [mint, c] of Object.entries(cb)) {
     const tok = tokens.find(t => t.mint === mint);
     for (const t of c.trades) {
       if (t.type === "SELL" && t.sol > 0) {
-        if (!best || t.sol > best.sol) {
-          best = { mint, sol: t.sol, symbol: tok?.symbol || null, sig: t.sig };
-        }
+        if (!best || t.sol > best.sol) best = { mint, sol: t.sol, symbol: tok?.symbol || null, sig: t.sig };
       }
     }
   }
-  // Also check net PnL per token (in case no sells yet but holding is profitable)
   if (!best) {
     for (const [mint, c] of Object.entries(cb)) {
       const tok = tokens.find(t => t.mint === mint);
       const pnl = tokenTotalPnl(c, tok);
-      if (!best || pnl > best.sol) {
-        best = { mint, sol: pnl, symbol: tok?.symbol || null };
-      }
+      if (!best || pnl > best.sol) best = { mint, sol: pnl, symbol: tok?.symbol || null };
     }
   }
   return best;
